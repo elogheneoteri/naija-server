@@ -1,12 +1,13 @@
 {
   "name": "delta-server",
-  "version": "1.0.0",
-  "description": "Realtime server for the Delta walking game",
+  "version": "2.0.0",
+  "description": "Realtime server for the Delta walking game with accounts",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
     "socket.io": "^4.7.5"
   },
   "engines": {
