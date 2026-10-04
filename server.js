@@ -12,6 +12,9 @@ const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 500;
 const WORLD_W = 2400;
 const WORLD_H = 900;
+const MAX_SPEED = 190;      // must match SPEED in game.js
+const GATE_LIMIT = 1295;    // players without "indigene" can't go past this x
+const SPAWN = { x: 200, y: 450 };
 const DEV_TOOLS = process.env.DEV_TOOLS === 'true';
 const PROGRESS_STEPS = ['arrived', 'verified', 'indigene'];
 
@@ -99,8 +102,15 @@ io.on('connection', socket => {
       const player = {
         id: socket.id, userId, name: row.name,
         x: row.x, y: row.y, flip: false,
-        progress: row.progress, dirty: false
+        progress: row.progress, dirty: false,
+        lastMoveAt: Date.now()
       };
+      // Safety: someone who hasn't finished immigration can't start past the gate
+      if (player.progress !== 'indigene' && player.x > GATE_LIMIT) {
+        player.x = SPAWN.x;
+        player.y = SPAWN.y;
+        player.dirty = true;
+      }
       players.set(socket.id, player);
       byUser.set(userId, socket.id);
       socket.data.joined = true;
@@ -126,11 +136,28 @@ io.on('connection', socket => {
   socket.on('move', data => {
     const p = players.get(socket.id);
     if (!p || !data) return;
-    const x = Number(data.x);
-    const y = Number(data.y);
+    let x = Number(data.x);
+    let y = Number(data.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-    p.x = Math.max(0, Math.min(WORLD_W, x));
-    p.y = Math.max(0, Math.min(WORLD_H, y));
+    x = Math.max(0, Math.min(WORLD_W, x));
+    y = Math.max(0, Math.min(WORLD_H, y));
+
+    // Speed check: no teleporting or speed hacks
+    const now = Date.now();
+    const dt = Math.min(now - p.lastMoveAt, 1000);
+    p.lastMoveAt = now;
+    const maxStep = MAX_SPEED * (dt / 1000) * 1.6 + 12;
+    let rejected = Math.hypot(x - p.x, y - p.y) > maxStep;
+
+    // Gate check: needs the "indigene" progress to go past the gate
+    if (!rejected && p.progress !== 'indigene' && x > GATE_LIMIT) rejected = true;
+
+    if (rejected) {
+      socket.emit('correct', { x: p.x, y: p.y });
+      return;
+    }
+    p.x = x;
+    p.y = y;
     p.flip = !!data.flip;
     p.dirty = true;
     socket.broadcast.emit('moved', { id: p.id, x: p.x, y: p.y, flip: p.flip });
@@ -144,6 +171,13 @@ io.on('connection', socket => {
     if (error) { console.error(error.message); return; }
     p.progress = value;
     socket.emit('progress', { progress: value });
+    if (value !== 'indigene' && p.x > GATE_LIMIT) {
+      p.x = SPAWN.x;
+      p.y = SPAWN.y;
+      p.dirty = true;
+      socket.emit('correct', { x: p.x, y: p.y });
+      socket.broadcast.emit('moved', { id: p.id, x: p.x, y: p.y, flip: p.flip });
+    }
   });
 
   socket.on('disconnect', () => {
