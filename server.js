@@ -10,11 +10,11 @@ const { createClient } = require('@supabase/supabase-js');
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 500;
-const WORLD_W = 2400;
-const WORLD_H = 900;
+const WORLD_W = 3900;
+const WORLD_H = 1500;
 const MAX_SPEED = 190;      // must match SPEED in game.js
-const GATE_LIMIT = 1295;    // players without "indigene" can't go past this x
-const SPAWN = { x: 200, y: 450 };
+const GATE_LIMIT = 1995;    // players without "indigene" can't go past this x
+const SPAWN = { x: 470, y: 850 };
 const DEV_TOOLS = process.env.DEV_TOOLS === 'true';
 const PROGRESS_STEPS = ['arrived', 'verified', 'indigene'];
 
