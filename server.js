@@ -22,6 +22,9 @@ const PROGRESS_STEPS = ['arrived', 'verified', 'indigene'];
 // here per player once the shop exists. Keep the free list in step with characters.json.
 const FREE_CHARACTERS = ['male_civilian', 'male_wong', 'male_streetwear', 'female_floral', 'female_sammie', 'female_rocker'];
 const DEFAULT_CHARACTER = 'male_civilian';
+const isHex = v => typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v);
+const cleanLook = l => { l = l || {}; return { top: isHex(l.top) ? l.top : null, bottom: isHex(l.bottom) ? l.bottom : null, shoes: isHex(l.shoes) ? l.shoes : null, hair: isHex(l.hair) ? l.hair : null }; };
+const parseLook = v => { try { return cleanLook(typeof v === 'string' ? JSON.parse(v) : v); } catch (e) { return cleanLook(); } };
 const validCharacter = id => (FREE_CHARACTERS.includes(id) ? id : null);
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
@@ -49,7 +52,7 @@ function cleanName(n) {
 }
 
 function publicView(p) {
-  return { id: p.id, name: p.name, x: p.x, y: p.y, flip: p.flip, character: p.character };
+  return { id: p.id, name: p.name, x: p.x, y: p.y, flip: p.flip, character: p.character, look: p.look };
 }
 
 async function savePlayer(p) {
@@ -111,6 +114,14 @@ io.on('connection', socket => {
         if (saved.error) console.error('Could not save character:', saved.error.message);
       }
 
+      // Clothing colours: the saved ones, otherwise the ones chosen on the client (needs a "look" text column)
+      let look = parseLook(row.look);
+      if (!row.look && data.look) {
+        look = cleanLook(data.look);
+        const sv = await db.from('players').update({ look: JSON.stringify(look) }).eq('id', userId);
+        if (sv.error) console.error('Could not save look:', sv.error.message);
+      }
+
       // Same account logging in twice: the older session is removed
       const oldId = byUser.get(userId);
       if (oldId) {
@@ -119,7 +130,7 @@ io.on('connection', socket => {
       }
 
       const player = {
-        id: socket.id, userId, name: row.name, character,
+        id: socket.id, userId, name: row.name, character, look,
         x: row.x, y: row.y, flip: false,
         progress: row.progress, dirty: false,
         lastMoveAt: Date.now()
@@ -138,6 +149,7 @@ io.on('connection', socket => {
         you: socket.id,
         name: player.name,
         character: player.character,
+        look: player.look,
         progress: player.progress,
         devTools: DEV_TOOLS,
         x: player.x,
@@ -192,6 +204,17 @@ io.on('connection', socket => {
     if (error) { console.error('set_character failed:', error.message); return; }
     p.character = character;
     io.emit('character', { id: p.id, character });
+  });
+
+  // The player changes their clothing colours
+  socket.on('set_look', async data => {
+    const p = players.get(socket.id);
+    if (!p) return;
+    const look = cleanLook(data);
+    const { error } = await db.from('players').update({ look: JSON.stringify(look) }).eq('id', p.userId);
+    if (error) { console.error('set_look failed:', error.message); return; }
+    p.look = look;
+    io.emit('look', { id: p.id, look });
   });
 
   // Testing only: lets the test button set progress until the NPC exists (Step 6)
