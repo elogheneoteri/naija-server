@@ -20,7 +20,7 @@ const PROGRESS_STEPS = ['arrived', 'verified', 'indigene'];
 
 // Characters a player may pick. Premium characters are NOT allowed yet: they will be added
 // here per player once the shop exists. Keep the free list in step with characters.json.
-const FREE_CHARACTERS = ['male_civilian', 'male_wong', 'male_streetwear', 'female_floral', 'female_elizabeth', 'female_rocker'];
+const FREE_CHARACTERS = ['male_civilian', 'male_wong', 'male_streetwear', 'female_floral', 'female_sammie', 'female_rocker'];
 const DEFAULT_CHARACTER = 'male_civilian';
 const validCharacter = id => (FREE_CHARACTERS.includes(id) ? id : null);
 
