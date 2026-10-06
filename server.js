@@ -18,6 +18,12 @@ const SPAWN = { x: 470, y: 850 };
 const DEV_TOOLS = process.env.DEV_TOOLS === 'true';
 const PROGRESS_STEPS = ['arrived', 'verified', 'indigene'];
 
+// Characters a player may pick. Premium characters are NOT allowed yet: they will be added
+// here per player once the shop exists. Keep the free list in step with characters.json.
+const FREE_CHARACTERS = ['male_civilian', 'male_wong', 'male_streetwear', 'female_floral', 'female_elizabeth', 'female_rocker'];
+const DEFAULT_CHARACTER = 'male_civilian';
+const validCharacter = id => (FREE_CHARACTERS.includes(id) ? id : null);
+
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
   console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variable.');
   process.exit(1);
@@ -43,7 +49,7 @@ function cleanName(n) {
 }
 
 function publicView(p) {
-  return { id: p.id, name: p.name, x: p.x, y: p.y, flip: p.flip };
+  return { id: p.id, name: p.name, x: p.x, y: p.y, flip: p.flip, character: p.character };
 }
 
 async function savePlayer(p) {
@@ -81,15 +87,28 @@ io.on('connection', socket => {
       }
       let row = found.data;
       if (!row) {
-        const created = await db.from('players')
-          .insert({ id: userId, name: cleanName(data.name) })
+        const wanted = validCharacter(data.character) || DEFAULT_CHARACTER;
+        let created = await db.from('players')
+          .insert({ id: userId, name: cleanName(data.name), character: wanted })
           .select().single();
+        // the "character" column may not exist yet: create the player without it
+        if (created.error && created.error.code !== '23505' && /character/i.test(created.error.message)) {
+          created = await db.from('players').insert({ id: userId, name: cleanName(data.name) }).select().single();
+        }
         if (created.error) {
           socket.emit('join_error',
             created.error.code === '23505' ? 'That name is taken. Choose another.' : 'Could not create player.');
           return;
         }
         row = created.data;
+      }
+
+      // Which character this player uses: the saved one, otherwise the one they picked on the client
+      let character = validCharacter(row.character);
+      if (!character) {
+        character = validCharacter(data.character) || DEFAULT_CHARACTER;
+        const saved = await db.from('players').update({ character }).eq('id', userId);
+        if (saved.error) console.error('Could not save character:', saved.error.message);
       }
 
       // Same account logging in twice: the older session is removed
@@ -100,7 +119,7 @@ io.on('connection', socket => {
       }
 
       const player = {
-        id: socket.id, userId, name: row.name,
+        id: socket.id, userId, name: row.name, character,
         x: row.x, y: row.y, flip: false,
         progress: row.progress, dirty: false,
         lastMoveAt: Date.now()
@@ -118,6 +137,7 @@ io.on('connection', socket => {
       socket.emit('init', {
         you: socket.id,
         name: player.name,
+        character: player.character,
         progress: player.progress,
         devTools: DEV_TOOLS,
         x: player.x,
@@ -161,6 +181,17 @@ io.on('connection', socket => {
     p.flip = !!data.flip;
     p.dirty = true;
     socket.broadcast.emit('moved', { id: p.id, x: p.x, y: p.y, flip: p.flip });
+  });
+
+  // The player picks one of the free characters
+  socket.on('set_character', async id => {
+    const p = players.get(socket.id);
+    const character = validCharacter(id);
+    if (!p || !character || character === p.character) return;
+    const { error } = await db.from('players').update({ character }).eq('id', p.userId);
+    if (error) { console.error('set_character failed:', error.message); return; }
+    p.character = character;
+    io.emit('character', { id: p.id, character });
   });
 
   // Testing only: lets the test button set progress until the NPC exists (Step 6)
