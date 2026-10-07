@@ -5,6 +5,7 @@
 //   DEV_TOOLS             "true" while testing (lets the test button change progress)
 
 const http = require('http');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -17,6 +18,17 @@ const GATE_LIMIT = 1995;    // players without "indigene" can't go past this x
 const SPAWN = { x: 470, y: 850 };
 const DEV_TOOLS = process.env.DEV_TOOLS === 'true';
 const PROGRESS_STEPS = ['arrived', 'verified', 'indigene'];
+
+// ----- NIN card (Ivory, Immigration Office) -----
+// Needs these columns on the players table (run nin_setup.sql once in the Supabase SQL editor):
+//   nin_form jsonb, nin_ready_at timestamptz, nin_card jsonb, nin_number text unique
+const NIN_WAIT_MS = 2 * 60 * 1000;           // the wait after the form is handed in
+const NIN_AGE_MIN = 16, NIN_AGE_MAX = 40;
+const NIN_STATE = 'DELTA';                   // state of origin on every card for now (Lagos / Abuja come with the state pick)
+// Where Ivory stands, in server pixels (30 px = 1 m): building at x 50 m, z 11.8 m + IVORY_SPOT in immigration_office.js.
+const IVORY_PX = { x: 1269, y: 450 };
+const NIN_REACH_PX = 8 * 30;                 // a player must be within 8 m of Ivory to hand in the form or collect the card
+const NAME_RE = /^[A-Za-z][A-Za-z'\- ]{1,19}$/;
 
 // Characters a player may pick. Premium characters are NOT allowed yet: they will be added
 // here per player once the shop exists. Keep the free list in step with characters.json.
@@ -47,6 +59,44 @@ function cleanName(n) {
   const name = String(n || '').trim().replace(/[^\w \-]/g, '').slice(0, 16);
   return name || 'Player' + Math.floor(Math.random() * 900 + 100);
 }
+
+// ----- NIN helpers -----
+function ninFromRow(row) {
+  const enabled = 'nin_form' in row && 'nin_card' in row && 'nin_ready_at' in row;
+  return {
+    enabled,
+    form: enabled ? row.nin_form || null : null,
+    readyAt: enabled && row.nin_ready_at ? new Date(row.nin_ready_at).getTime() : 0,
+    card: enabled ? row.nin_card || null : null,
+    busy: false
+  };
+}
+
+// What the client is told. remainingMs (not a clock time) so a wrong clock on the phone does not matter.
+function ninState(p) {
+  const n = p.nin;
+  if (!n.enabled) return { status: 'disabled' };
+  if (n.card) return { status: 'issued', card: n.card };
+  if (n.readyAt) {
+    const left = n.readyAt - Date.now();
+    return left > 0 ? { status: 'waiting', remainingMs: left } : { status: 'ready', remainingMs: 0 };
+  }
+  return { status: 'none' };
+}
+
+const nearIvory = p => Math.hypot(p.x - IVORY_PX.x, p.y - IVORY_PX.y) <= NIN_REACH_PX;
+const isMissingColumn = e => !!e && (e.code === '42703' || e.code === 'PGRST204' || /column|schema cache/i.test(e.message || ''));
+const randDigits = n => Array.from({ length: n }, () => crypto.randomInt(0, 10)).join('');
+
+// Date of birth from the age the player picked: today minus that many years, minus 0-360 extra days, so the age always works out right.
+function makeDob(age) {
+  const now = new Date();
+  const d = new Date(Date.UTC(now.getUTCFullYear() - age, now.getUTCMonth(), now.getUTCDate()));
+  d.setUTCDate(d.getUTCDate() - crypto.randomInt(0, 361));
+  return d.toISOString().slice(0, 10);
+}
+
+const titleCase = s => s.toLowerCase().replace(/(^|[ '\-])([a-z])/g, (m, a, b) => a + b.toUpperCase());
 
 function publicView(p) {
   return { id: p.id, name: p.name, x: p.x, y: p.y, flip: p.flip, character: p.character };
@@ -122,6 +172,7 @@ io.on('connection', socket => {
         id: socket.id, userId, name: row.name, character,
         x: row.x, y: row.y, flip: false,
         progress: row.progress, dirty: false,
+        nin: ninFromRow(row),
         lastMoveAt: Date.now()
       };
       // Safety: someone who hasn't finished immigration can't start past the gate
@@ -139,6 +190,7 @@ io.on('connection', socket => {
         name: player.name,
         character: player.character,
         progress: player.progress,
+        nin: ninState(player),
         devTools: DEV_TOOLS,
         x: player.x,
         y: player.y,
@@ -209,6 +261,87 @@ io.on('connection', socket => {
       socket.emit('correct', { x: p.x, y: p.y });
       socket.broadcast.emit('moved', { id: p.id, x: p.x, y: p.y, flip: p.flip });
     }
+  });
+
+  // ----- NIN card -----
+  // 1) the player hands in the form to Ivory: starts the 2-minute wait (saved, so it survives logging out)
+  socket.on('nin_submit', async data => {
+    const p = players.get(socket.id);
+    if (!p || !data) return;
+    const n = p.nin;
+    if (!n.enabled) { socket.emit('nin_error', 'The NIN system is not set up on the server yet.'); return; }
+    if (n.busy || n.card || n.readyAt) { socket.emit('nin', ninState(p)); return; }
+    if (!nearIvory(p)) { socket.emit('nin_error', 'Please stand closer to Ivory.'); return; }
+    const first = String(data.first || '').trim().replace(/\s+/g, ' ');
+    const last = String(data.last || '').trim().replace(/\s+/g, ' ');
+    const age = Number(data.age);
+    if (!NAME_RE.test(first) || !NAME_RE.test(last)) { socket.emit('nin_error', 'Names use letters only (2 to 20 characters).'); return; }
+    if (!Number.isInteger(age) || age < NIN_AGE_MIN || age > NIN_AGE_MAX) {
+      socket.emit('nin_error', 'Age must be between ' + NIN_AGE_MIN + ' and ' + NIN_AGE_MAX + '.'); return;
+    }
+    n.busy = true;
+    try {
+      const form = { first: titleCase(first), last: titleCase(last), age, dob: makeDob(age) };
+      const readyAt = Date.now() + NIN_WAIT_MS;
+      const { error } = await db.from('players').update({ nin_form: form, nin_ready_at: new Date(readyAt).toISOString() }).eq('id', p.userId);
+      if (error) {
+        console.error('nin_submit failed:', error.message);
+        socket.emit('nin_error', isMissingColumn(error) ? 'The NIN system is not set up on the server yet.' : 'Could not save your form. Try again.');
+        return;
+      }
+      n.form = form; n.readyAt = readyAt;
+      socket.emit('nin', ninState(p));
+    } finally { n.busy = false; }
+  });
+
+  // 2) after the wait, the player collects the card: the server makes the unique NIN and saves the card
+  socket.on('nin_collect', async () => {
+    const p = players.get(socket.id);
+    if (!p) return;
+    const n = p.nin;
+    if (!n.enabled) { socket.emit('nin_error', 'The NIN system is not set up on the server yet.'); return; }
+    if (n.busy) return;
+    if (n.card || !n.form || !n.readyAt || Date.now() < n.readyAt) { socket.emit('nin', ninState(p)); return; }
+    if (!nearIvory(p)) { socket.emit('nin_error', 'Please stand closer to Ivory.'); return; }
+    n.busy = true;
+    try {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const card = {
+          name: (n.form.first + ' ' + n.form.last).toUpperCase(), first: n.form.first, last: n.form.last,
+          nin: String(crypto.randomInt(1, 10)) + randDigits(10),          // 11 digits, never starts with 0
+          dob: n.form.dob,
+          sex: /^female/.test(p.character) ? 'FEMALE' : 'MALE',
+          nationality: 'NIGERIAN',
+          state: NIN_STATE,
+          registered: new Date().toISOString().slice(0, 10),
+          doc: 'NVD' + randDigits(9)
+        };
+        const { error } = await db.from('players').update({ nin_card: card, nin_number: card.nin }).eq('id', p.userId);
+        if (!error) { n.card = card; socket.emit('nin', ninState(p)); return; }
+        if (error.code === '23505') continue;                              // that NIN already exists: make another
+        console.error('nin_collect failed:', error.message);
+        socket.emit('nin_error', 'Could not save your card. Try again.');
+        return;
+      }
+      socket.emit('nin_error', 'Could not make a unique NIN. Try again.');
+    } finally { n.busy = false; }
+  });
+
+  // Testing only (DEV_TOOLS): start the NIN quest again, or skip the 2-minute wait
+  socket.on('dev_nin', async action => {
+    const p = players.get(socket.id);
+    if (!DEV_TOOLS || !p || !p.nin.enabled) return;
+    if (action === 'reset') {
+      const { error } = await db.from('players').update({ nin_form: null, nin_ready_at: null, nin_card: null, nin_number: null }).eq('id', p.userId);
+      if (error) { console.error(error.message); return; }
+      p.nin.form = null; p.nin.readyAt = 0; p.nin.card = null;
+    } else if (action === 'skip' && p.nin.readyAt && !p.nin.card) {
+      const now = Date.now();
+      const { error } = await db.from('players').update({ nin_ready_at: new Date(now).toISOString() }).eq('id', p.userId);
+      if (error) { console.error(error.message); return; }
+      p.nin.readyAt = now;
+    } else return;
+    socket.emit('nin', ninState(p));
   });
 
   socket.on('disconnect', () => {
