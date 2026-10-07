@@ -11,8 +11,8 @@ const { createClient } = require('@supabase/supabase-js');
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 500;
-const WORLD_W = 3900;
-const WORLD_H = 1500;
+const WORLD_W = 10800;   // 360 m (the city lies east of the gate)
+const WORLD_H = 7200;    // 240 m
 const MAX_SPEED = 190;      // must match SPEED in game.js
 const GATE_LIMIT = 1995;    // players without "indigene" can't go past this x
 const SPAWN = { x: 470, y: 850 };
@@ -98,8 +98,11 @@ function makeDob(age) {
 
 const titleCase = s => s.toLowerCase().replace(/(^|[ '\-])([a-z])/g, (m, a, b) => a + b.toUpperCase());
 
+// The name other players see above a character: the name on the NIN card once the player has collected one.
+const displayName = p => (p.nin && p.nin.card && p.nin.card.first ? p.nin.card.first + ' ' + p.nin.card.last : p.name);
+
 function publicView(p) {
-  return { id: p.id, name: p.name, x: p.x, y: p.y, flip: p.flip, character: p.character };
+  return { id: p.id, name: displayName(p), x: p.x, y: p.y, flip: p.flip, character: p.character };
 }
 
 async function savePlayer(p) {
@@ -187,7 +190,7 @@ io.on('connection', socket => {
 
       socket.emit('init', {
         you: socket.id,
-        name: player.name,
+        name: displayName(player),
         character: player.character,
         progress: player.progress,
         nin: ninState(player),
@@ -316,8 +319,14 @@ io.on('connection', socket => {
           registered: new Date().toISOString().slice(0, 10),
           doc: 'NVD' + randDigits(9)
         };
-        const { error } = await db.from('players').update({ nin_card: card, nin_number: card.nin }).eq('id', p.userId);
-        if (!error) { n.card = card; socket.emit('nin', ninState(p)); return; }
+        const { error } = await db.from('players').update({ nin_card: card, nin_number: card.nin, progress: 'indigene' }).eq('id', p.userId);
+        if (!error) {
+          n.card = card; p.progress = 'indigene';
+          socket.emit('nin', ninState(p));
+          socket.emit('progress', { progress: 'indigene' });                 // status becomes Indigene and the gate opens
+          io.emit('renamed', { id: p.id, name: displayName(p) });            // everybody sees the new name tag
+          return;
+        }
         if (error.code === '23505') continue;                              // that NIN already exists: make another
         console.error('nin_collect failed:', error.message);
         socket.emit('nin_error', 'Could not save your card. Try again.');
@@ -332,9 +341,16 @@ io.on('connection', socket => {
     const p = players.get(socket.id);
     if (!DEV_TOOLS || !p || !p.nin.enabled) return;
     if (action === 'reset') {
-      const { error } = await db.from('players').update({ nin_form: null, nin_ready_at: null, nin_card: null, nin_number: null }).eq('id', p.userId);
+      const { error } = await db.from('players').update({ nin_form: null, nin_ready_at: null, nin_card: null, nin_number: null, progress: 'arrived' }).eq('id', p.userId);
       if (error) { console.error(error.message); return; }
-      p.nin.form = null; p.nin.readyAt = 0; p.nin.card = null;
+      p.nin.form = null; p.nin.readyAt = 0; p.nin.card = null; p.progress = 'arrived';
+      socket.emit('progress', { progress: 'arrived' });
+      io.emit('renamed', { id: p.id, name: displayName(p) });
+      if (p.x > GATE_LIMIT) {                                                // was past the gate: back to the camp
+        p.x = SPAWN.x; p.y = SPAWN.y; p.dirty = true;
+        socket.emit('correct', { x: p.x, y: p.y });
+        socket.broadcast.emit('moved', { id: p.id, x: p.x, y: p.y, flip: p.flip });
+      }
     } else if (action === 'skip' && p.nin.readyAt && !p.nin.card) {
       const now = Date.now();
       const { error } = await db.from('players').update({ nin_ready_at: new Date(now).toISOString() }).eq('id', p.userId);
